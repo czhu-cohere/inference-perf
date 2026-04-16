@@ -1,0 +1,29 @@
+api:
+  type: completion
+
+server:
+  type: vllm
+  base_url: http://conway-zhu-vllm-202604132301-edc0-head:8000
+  model_name: lls-1t-bf16-tep-16
+
+tokenizer:
+  pretrained_model_name_or_path: /Users/conwayzhu/work/models/c5-tokenizer
+
+data:
+  type: random
+  input_distribution:
+    min: 8192
+    max: 8192
+    mean: 8192
+    std_dev: 0
+  output_distribution:
+    min: 1024
+    max: 1024
+    mean: 1024
+    std_dev: 0
+
+load:
+  type: concurrent
+  stages:
+    - num_requests: 1500
+      concurrency_level: 1500

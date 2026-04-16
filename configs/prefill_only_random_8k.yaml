@@ -1,0 +1,33 @@
+api:
+  type: completion
+
+server:
+  type: vllm
+  base_url: http://conway-zhu-vllm-202604132337-a83e-head:8000
+  model_name: lls-1t-bf16-tep-16
+
+tokenizer:
+  pretrained_model_name_or_path: /Users/conwayzhu/work/models/c5-tokenizer
+
+data:
+  type: random
+  input_distribution:
+    min: 8192
+    max: 8192
+    mean: 8192
+    std_dev: 0
+    total_count: 1280
+  output_distribution:
+    min: 1
+    max: 1
+    mean: 1
+    std_dev: 0
+    total_count: 1280
+
+load:
+  type: concurrent
+  stages:
+    - num_requests: 1280
+      # for DEP32 we had to set this higher than 64 to reach peak perf.
+      # concurrency_level: 64
+      concurrency_level: 256
