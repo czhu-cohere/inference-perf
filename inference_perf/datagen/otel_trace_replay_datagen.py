@@ -635,14 +635,20 @@ class OTelChatCompletionAPIData(ChatCompletionAPIData):
         output_text: str = ""
 
         if config.streaming:
-            # Use shared streaming parser with chat-specific content extraction
-            output_text, output_token_times, raw_content = await parse_sse_stream(
+            output_text, output_token_times, raw_content, usage = await parse_sse_stream(
                 response, extract_content=lambda data: data.get("choices", [{}])[0].get("delta", {}).get("content")
             )
 
-            prompt_text = "".join([msg.content for msg in self.messages if msg.content])
-            prompt_len = tokenizer.count_tokens(prompt_text)
-            output_len = tokenizer.count_tokens(output_text)
+            if usage:
+                prompt_len = usage.get(
+                    "prompt_tokens",
+                    tokenizer.count_tokens("".join([msg.content for msg in self.messages if msg.content])),
+                )
+                output_len = usage.get("completion_tokens", tokenizer.count_tokens(output_text))
+            else:
+                prompt_text = "".join([msg.content for msg in self.messages if msg.content])
+                prompt_len = tokenizer.count_tokens(prompt_text)
+                output_len = tokenizer.count_tokens(output_text)
             info = OTelInferenceInfo(
                 input_tokens=prompt_len,
                 output_tokens=output_len,
@@ -653,11 +659,19 @@ class OTelChatCompletionAPIData(ChatCompletionAPIData):
             )
         else:
             data = await response.json()
-            prompt_len = tokenizer.count_tokens("".join([m.content for m in self.messages]))
+            usage = data.get("usage")
             choices = data.get("choices", [])
             if choices:
                 output_text = "".join([choice.get("message", {}).get("content", "") for choice in choices])
-            output_len = tokenizer.count_tokens(output_text)
+            if usage:
+                prompt_len = usage.get(
+                    "prompt_tokens",
+                    tokenizer.count_tokens("".join([m.content for m in self.messages])),
+                )
+                output_len = usage.get("completion_tokens", tokenizer.count_tokens(output_text))
+            else:
+                prompt_len = tokenizer.count_tokens("".join([m.content for m in self.messages]))
+                output_len = tokenizer.count_tokens(output_text)
             info = OTelInferenceInfo(
                 input_tokens=prompt_len,
                 output_tokens=output_len,

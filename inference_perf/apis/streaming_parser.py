@@ -28,7 +28,7 @@ from aiohttp import ClientResponse
 
 async def parse_sse_stream(
     response: ClientResponse, extract_content: Callable[[dict[str, Any]], Optional[str]]
-) -> Tuple[str, List[float], str]:
+) -> Tuple[str, List[float], str, Optional[dict[str, int]]]:
     """
     Parse Server-Sent Events (SSE) stream and extract content.
 
@@ -44,20 +44,22 @@ async def parse_sse_stream(
                         Example: lambda data: data.get("choices", [{}])[0].get("delta", {}).get("content")
 
     Returns:
-        Tuple of (output_text, output_token_times, raw_content) where:
+        Tuple of (output_text, output_token_times, raw_content, usage) where:
         - output_text: The concatenated text content from all chunks
         - output_token_times: List of timestamps when each token was received
         - raw_content: The raw string content of the stream
+        - usage: The usage dict from the final chunk (with prompt_tokens,
+          completion_tokens, total_tokens), or None if not present
 
     Example:
         # For chat completions
-        output_text, times, raw = await parse_sse_stream(
+        output_text, times, raw, usage = await parse_sse_stream(
             response,
             lambda d: d.get("choices", [{}])[0].get("delta", {}).get("content")
         )
 
         # For text completions
-        output_text, times, raw = await parse_sse_stream(
+        output_text, times, raw, usage = await parse_sse_stream(
             response,
             lambda d: d.get("choices", [{}])[0].get("text")
         )
@@ -66,6 +68,7 @@ async def parse_sse_stream(
     output_token_times: List[float] = []
     buffer = b""
     raw_content = b""
+    usage: Optional[dict[str, int]] = None
 
     async for chunk in response.content.iter_any():
         raw_content += chunk
@@ -80,6 +83,8 @@ async def parse_sse_stream(
                         break
                     try:
                         data = json.loads(data_str)
+                        if data.get("usage"):
+                            usage = data["usage"]
                         if content := extract_content(data):
                             output_text += content
                     except (json.JSONDecodeError, IndexError):
@@ -88,4 +93,4 @@ async def parse_sse_stream(
                 continue
             break
 
-    return output_text, output_token_times, raw_content.decode("utf-8", errors="ignore")
+    return output_text, output_token_times, raw_content.decode("utf-8", errors="ignore"), usage

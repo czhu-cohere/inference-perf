@@ -51,13 +51,16 @@ class CompletionAPIData(InferenceAPIData):
         self, response: ClientResponse, config: APIConfig, tokenizer: CustomTokenizer, lora_adapter: Optional[str] = None
     ) -> InferenceInfo:
         if config.streaming:
-            # Use shared streaming parser with completion-specific content extraction
-            output_text, output_token_times, raw_content = await parse_sse_stream(
+            output_text, output_token_times, raw_content, usage = await parse_sse_stream(
                 response, extract_content=lambda data: data.get("choices", [{}])[0].get("text")
             )
 
-            prompt_len = tokenizer.count_tokens(self.prompt)
-            output_len = tokenizer.count_tokens(output_text)
+            if usage:
+                prompt_len = usage.get("prompt_tokens", tokenizer.count_tokens(self.prompt))
+                output_len = usage.get("completion_tokens", tokenizer.count_tokens(output_text))
+            else:
+                prompt_len = tokenizer.count_tokens(self.prompt)
+                output_len = tokenizer.count_tokens(output_text)
             self.model_response = output_text
             return InferenceInfo(
                 input_tokens=prompt_len,
@@ -68,11 +71,18 @@ class CompletionAPIData(InferenceAPIData):
             )
         else:
             data = await response.json()
-            prompt_len = tokenizer.count_tokens(self.prompt)
+            usage = data.get("usage")
             choices = data.get("choices", [])
+            if usage:
+                prompt_len = usage.get("prompt_tokens", tokenizer.count_tokens(self.prompt))
+            else:
+                prompt_len = tokenizer.count_tokens(self.prompt)
             if len(choices) == 0:
                 return InferenceInfo(input_tokens=prompt_len, lora_adapter=lora_adapter)
             output_text = choices[0].get("text", "")
-            output_len = tokenizer.count_tokens(output_text)
+            if usage:
+                output_len = usage.get("completion_tokens", tokenizer.count_tokens(output_text))
+            else:
+                output_len = tokenizer.count_tokens(output_text)
             self.model_response = output_text
             return InferenceInfo(input_tokens=prompt_len, output_tokens=output_len, lora_adapter=lora_adapter)

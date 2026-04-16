@@ -25,5 +25,5 @@ data:
 load:
   type: concurrent
   stages:
-    - num_requests: 1500
-      concurrency_level: 1500
+    - num_requests: 1000
+      concurrency_level: 1000
