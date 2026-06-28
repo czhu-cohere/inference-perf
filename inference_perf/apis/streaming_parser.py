@@ -21,9 +21,12 @@ LLM APIs, reducing code duplication across different API types.
 
 import json
 import time
-from typing import Any, Callable, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple
 
 from aiohttp import ClientResponse
+
+if TYPE_CHECKING:
+    from inference_perf.utils.custom_tokenizer import CustomTokenizer
 
 
 class StreamInterruptedError(Exception):
@@ -113,3 +116,22 @@ async def parse_sse_stream(
         raise StreamInterruptedError(e, raw_content.decode("utf-8", errors="ignore")) from e
 
     return output_text, chunk_times, raw_content.decode("utf-8", errors="ignore"), response_chunks, server_usage
+
+
+def resolve_output_token_count(
+    server_usage: Optional[dict[str, Any]], output_text: str, tokenizer: "CustomTokenizer"
+) -> int:
+    """Prefer the server's exact `completion_tokens` over client-side re-tokenization.
+
+    The server's `usage.completion_tokens` is an exact count of decode steps and
+    also captures tokens (reasoning, tool-call arguments) that never appear in the
+    concatenated content text. Re-tokenizing the streamed text is an approximation
+    that can drift from the true count (per-chunk special tokens, tokenizer
+    mismatch, non-content tokens). Fall back to re-tokenization only when the
+    server does not report usage. See #564.
+    """
+    if server_usage:
+        completion_tokens = server_usage.get("completion_tokens")
+        if completion_tokens:
+            return int(completion_tokens)
+    return tokenizer.count_tokens(output_text)
