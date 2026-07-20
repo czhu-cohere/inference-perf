@@ -64,6 +64,15 @@ class MultiprocessRequestMetricCollector(RequestMetricCollector):
 
         yield
 
+        # Wait for every metric that workers have put() to be consumed before
+        # sending the terminating sentinel. put() only buffers into a per-process
+        # feeder thread with no cross-producer ordering, so a sentinel enqueued
+        # here could otherwise overtake metrics still in flight and the collector
+        # would stop early, silently dropping them (reported as neither successes
+        # nor failures). join() blocks until unfinished_tasks hits zero — run it
+        # off the event loop so the collector coroutine can keep draining.
+        await get_event_loop().run_in_executor(None, self.queue.join)
+
         self.queue.put(None)
         self.metrics = await collector_task
         logger.debug(f"Collector collected {len(self.metrics)} metrics")
