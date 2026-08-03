@@ -104,6 +104,11 @@ class Worker(mp.Process):
         shared_max_concurrency: Optional["Synchronized[int]"],
         base_seed: int,
         stage_barrier: Optional[SyncBarrier] = None,
+        pre_generate: bool = False,
+        warmup_phase: Optional[SyncEvent] = None,
+        warmup_barrier: Optional[SyncBarrier] = None,
+        warmup_num_requests: Optional["Synchronized[int]"] = None,
+        warmup_active_workers: Optional["Synchronized[int]"] = None,
     ):
         super().__init__(daemon=True)  # kill worker process if main process exit unexpected
         self.id = id
@@ -120,6 +125,16 @@ class Worker(mp.Process):
         self.skip = False
         self.base_seed = base_seed
         self.stage_barrier = stage_barrier
+        # Pre-generation warmup coordination. When pre_generate is enabled, each worker
+        # materializes (generates + tokenizes) the payloads it will dispatch during a
+        # warmup phase that runs before the stage timer starts, so no tokenization happens
+        # on the dispatch critical path.
+        self.pre_generate = pre_generate
+        self.warmup_phase = warmup_phase
+        self.warmup_barrier = warmup_barrier
+        self.warmup_num_requests = warmup_num_requests
+        self.warmup_active_workers = warmup_active_workers
+        self._warmed_up = False
         # Snapshot the parent's effective root log level so the worker
         # interpreter (which under forkserver/spawn does not inherit the
         # parent's basicConfig) can configure its own handler to surface
@@ -151,6 +166,14 @@ class Worker(mp.Process):
                     semaphore = Semaphore(new_concurrency)
                     current_concurrency = new_concurrency
 
+            # Pre-generation warmup rendezvous. Every worker (including ones that will
+            # skip this stage because they were assigned 0 concurrency) must participate
+            # exactly once per stage so the warmup barrier stays balanced. Workers that
+            # are not skipping actually generate their assigned payloads here; skipped
+            # workers just rendezvous. This branch covers workers busy-looping the outer
+            # loop (e.g. concurrent workers between concurrency updates).
+            self._warmup_if_pending(generate=not self.skip)
+
             if not self.skip:
                 logger.debug(f"Worker {self.id} is currently working")
             else:
@@ -158,6 +181,11 @@ class Worker(mp.Process):
 
             # Process requests in loop
             while self.request_phase.is_set() and not self.cancel_signal.is_set() and not self.skip:
+                # Warmup can also become pending while a non-skipping worker is already
+                # spinning inside the dispatch loop on an empty queue (e.g. the first stage,
+                # where request_phase is set before the warmup signal). Handle it here too.
+                self._warmup_if_pending(generate=True)
+
                 await semaphore.acquire()
                 try:
                     # Use partial to pass named arg
@@ -257,12 +285,62 @@ class Worker(mp.Process):
                 await gather(*tasks)
                 tasks = []
                 LocalUserSession.clear_instances()
+                # Reset warmup state and drop any leftover pre-generated payloads so the
+                # next stage starts clean and memory is released promptly.
+                self._warmed_up = False
+                if self.pre_generate and isinstance(self.datagen, LazyLoadDataMixin):
+                    self.datagen.clear_pregenerated()
                 if self.stage_barrier:
                     self.stage_barrier.wait()
                 logger.debug(f"[Worker {self.id}] waiting for next phase")
                 self.request_phase.wait()
 
         logger.debug(f"[Worker {self.id}] stopped")
+
+    def _warmup_if_pending(self, generate: bool) -> bool:
+        """Run the pre-generation warmup once per stage if the main process signaled it.
+
+        Returns True if this call performed the warmup rendezvous. Every worker must call
+        this (with generate=False when it is skipping the stage) so the warmup barrier
+        stays balanced across all workers plus the main process.
+        """
+        if not self.pre_generate or self.warmup_phase is None or self.warmup_barrier is None:
+            return False
+        if self._warmed_up or not self.warmup_phase.is_set():
+            return False
+        if generate:
+            self._run_warmup()
+        self._warmed_up = True
+        # Rendezvous with the main process (and all other workers) so dispatch does not
+        # begin until every worker's payloads are materialized.
+        self.warmup_barrier.wait()
+        return True
+
+    def _run_warmup(self) -> None:
+        """Pre-generate this worker's assigned payloads for the upcoming stage.
+
+        Uses the same worker/data_index mapping as dispatch (round-robin over the active
+        workers) so that the payload a worker caches is the payload it later dispatches,
+        and the per-worker RNG advances identically to the lazy path.
+        """
+        if not isinstance(self.datagen, LazyLoadDataMixin):
+            return
+        if self.warmup_num_requests is None or self.warmup_active_workers is None:
+            return
+        with self.warmup_num_requests.get_lock():
+            num_requests = self.warmup_num_requests.value
+        with self.warmup_active_workers.get_lock():
+            active_workers = self.warmup_active_workers.value
+        if active_workers <= 0 or self.id >= active_workers:
+            # This worker will not be assigned any requests this stage.
+            self.datagen.clear_pregenerated()
+            return
+        indices = range(self.id, num_requests, active_workers)
+        self.datagen.pregenerate(indices)
+        logger.debug(
+            f"[Worker {self.id}] pre-generated {len(range(self.id, num_requests, active_workers))} "
+            f"payloads (num_requests={num_requests}, active_workers={active_workers})"
+        )
 
     def run(self) -> None:
         # forkserver/spawn workers start from a fresh interpreter without the
@@ -343,6 +421,21 @@ class LoadGenerator:
         self.base_seed: int = load_config.base_seed
         self._session_cursor: int = 0
 
+        # Resolve the pre-generation flag. Default to True for the concurrent load type
+        # (where a clean concurrent wave at t0 matters most) and False otherwise, unless
+        # the user set it explicitly. Pre-generation only applies to lazy-loading data
+        # generators; other generators already materialize their payloads eagerly.
+        if load_config.pre_generate is None:
+            pre_generate = self.load_type == LoadType.CONCURRENT
+        else:
+            pre_generate = load_config.pre_generate
+        self.pre_generate: bool = pre_generate and isinstance(self.datagen, LazyLoadDataMixin)
+        # Warmup coordination primitives, created in mp_run() before workers fork.
+        self._warmup_phase: Optional[SyncEvent] = None
+        self._warmup_barrier: Optional[SyncBarrier] = None
+        self._warmup_num_requests: Optional["Synchronized[int]"] = None
+        self._warmup_active_workers: Optional["Synchronized[int]"] = None
+
     def _sigint_handler(self, _signum: int, _frame: Optional[FrameType]) -> None:
         """SIGINT handler that sets interrup_sig flag to True"""
         self.interrupt_sig = True
@@ -365,6 +458,61 @@ class LoadGenerator:
         if self.lora_adapters is not None and self.lora_weights is not None:
             return str(np.random.choice(self.lora_adapters, p=self.lora_weights))
         return None
+
+    async def _run_pregeneration(self, num_requests: int, active_workers: int) -> None:
+        """Drive the worker-pool warmup: workers materialize all payloads before dispatch.
+
+        Publishes the stage's request count and active-worker count, signals the warmup
+        phase, and waits on the warmup barrier until every worker has generated (and cached)
+        its assigned payloads. Payloads are generated in parallel across the worker pool, each
+        worker using its own seeded RNG, so content stays byte-identical to the lazy path and
+        setup does not become a serial bottleneck. The barrier wait runs in an executor so the
+        main event loop (e.g. the metrics collector) stays responsive during long warmups.
+        """
+        if (
+            self._warmup_phase is None
+            or self._warmup_barrier is None
+            or self._warmup_num_requests is None
+            or self._warmup_active_workers is None
+        ):
+            return
+        self._warn_if_pregeneration_memory_large(num_requests)
+        with self._warmup_num_requests.get_lock():
+            self._warmup_num_requests.value = num_requests
+        with self._warmup_active_workers.get_lock():
+            self._warmup_active_workers.value = active_workers
+        logger.info("Pre-generating %d request payloads across %d worker(s) before dispatch", num_requests, active_workers)
+        self._warmup_phase.set()
+        # Wait until all workers have finished materializing their payloads, without blocking
+        # the event loop for the (potentially long) duration of generation.
+        warmup_barrier = self._warmup_barrier
+        await get_event_loop().run_in_executor(None, warmup_barrier.wait)
+        self._warmup_phase.clear()
+
+    def _warn_if_pregeneration_memory_large(self, num_requests: int) -> None:
+        """Best-effort guard: warn when pre-generating all payloads may use a lot of memory.
+
+        Pre-generation holds every request's payload in memory until it is dispatched, so
+        peak memory scales with num_requests * input_length. This is a soft warning, not a cap.
+        """
+        input_lengths = getattr(self.datagen, "input_lengths", None)
+        if input_lengths is None or len(input_lengths) == 0 or num_requests <= 0:
+            return
+        try:
+            max_len = int(max(input_lengths[: min(num_requests, len(input_lengths))]))
+        except (TypeError, ValueError):
+            return
+        # Rough upper bound assuming ~4 text bytes per token, all payloads resident at once.
+        est_bytes = num_requests * max_len * 4
+        threshold_bytes = 2 * 1024**3  # 2 GiB
+        if est_bytes > threshold_bytes:
+            logger.warning(
+                "Pre-generation may use ~%.1f GiB of memory for %d requests (max input ~%d tokens). "
+                "Consider reducing num_requests or disabling load.pre_generate for this stage.",
+                est_bytes / 1024**3,
+                num_requests,
+                max_len,
+            )
 
     def get_timer(self, rate: float, duration: float) -> LoadTimer:
         if self.load_type == LoadType.POISSON:
@@ -757,17 +905,32 @@ class LoadGenerator:
         request_phase.set()
         with finished_requests_counter.get_lock():
             finished_requests_counter.value = 0
-        timer = self.get_timer(rate, duration)
-
-        # Allow generation a second to begin populating the queue so the workers
-        # don't miss the initial scheuled request times
-        start_time_epoch = time.time()
-        start_time = time.perf_counter() + 1
 
         if isinstance(self.datagen, DataGenerator) and self.datagen.trace is not None:
             num_requests = self.datagen.get_request_count()
         else:
             num_requests = int(rate * duration)
+
+        # Number of workers that will receive requests this stage. With a concurrency_level
+        # some workers may be assigned 0 concurrency, so requests are only routed to the
+        # first `active_workers` workers.
+        active_workers = self.num_workers
+        if concurrency_level:
+            active_workers = min(self.num_workers, concurrency_level)
+
+        # Pre-generate all payloads (generation + tokenization) across the worker pool
+        # BEFORE starting the timer, so the timed dispatch loop only serializes payloads and
+        # issues requests. This lets requests reach the configured concurrency immediately.
+        if self.pre_generate and num_requests > 0:
+            await self._run_pregeneration(num_requests, active_workers)
+
+        timer = self.get_timer(rate, duration)
+
+        # Allow generation a second to begin populating the queue so the workers
+        # don't miss the initial scheuled request times. Timing is measured from here so
+        # the pre-generation warmup above is excluded from the timed stage.
+        start_time_epoch = time.time()
+        start_time = time.perf_counter() + 1
 
         stage_status = StageStatus.RUNNING
 
@@ -776,18 +939,19 @@ class LoadGenerator:
             data_generator = self.datagen.get_data()
         else:
             raise TypeError("run_stage requires DataGenerator, use run_session_stage for SessionGenerator")
-        active_workers = self.num_workers
-        if concurrency_level:
-            # If concurrency_level is set, some worker may get 0 concurrency, then we should re-evaluate workers we can assign reqeusts to.
-            active_workers = min(self.num_workers, concurrency_level)
 
-        for _ in range(num_requests):
+        for i in range(num_requests):
             request_data = next(data_generator)
             request_data.stage_id = stage_id
             lora_adapter = self._get_lora_adapter()
-            worker_id = request_data.preferred_worker_id
-            if worker_id >= 0:
-                worker_id = worker_id % active_workers
+            if self.pre_generate:
+                # Deterministic round-robin routing that matches the warmup mapping, so each
+                # request lands on the worker that pre-generated (and cached) it.
+                worker_id = i % active_workers
+            else:
+                worker_id = request_data.preferred_worker_id
+                if worker_id >= 0:
+                    worker_id = worker_id % active_workers
             request_queue.put(
                 RequestQueueData(stage_id, request_data, next(time_generator), lora_adapter),
                 worker_id,
@@ -935,9 +1099,10 @@ class LoadGenerator:
         logger.info(f"Generated load stages: {[s.rate for s in self.stages]}")
 
     async def mp_run(self, client: ModelServerClient) -> None:
-        request_queue: RequestQueue[RequestQueueData] = RequestQueue(
-            self.num_workers if self.datagen.is_preferred_worker_requested() else 1
-        )
+        # Pre-generation and preferred-worker routing both require per-worker channels so a
+        # request lands on the worker that materialized (or otherwise owns) it.
+        use_per_worker_channels = self.datagen.is_preferred_worker_requested() or self.pre_generate
+        request_queue: RequestQueue[RequestQueueData] = RequestQueue(self.num_workers if use_per_worker_channels else 1)
         finished_requests_counter: "Synchronized[int]" = mp.Value("i", 0)
         active_requests_counter: "Synchronized[int]" = mp.Value("i", 0)
         request_phase: SyncEvent = mp.Event()
@@ -946,6 +1111,15 @@ class LoadGenerator:
         # Synchronize workers and main at stage boundaries so workers finish
         # in-flight requests and clear session state before the next stage begins.
         stage_barrier: SyncBarrier = mp.Barrier(self.num_workers + 1)
+
+        # Pre-generation warmup coordination (only used when pre_generate is enabled).
+        # The warmup barrier rendezvous includes every worker plus the main process.
+        if self.pre_generate:
+            self._warmup_phase = mp.Event()
+            self._warmup_barrier = mp.Barrier(self.num_workers + 1)
+            self._warmup_num_requests = mp.Value("i", 0)
+            self._warmup_active_workers = mp.Value("i", 0)
+
         # start workers in the request phase
         request_phase.set()
 
@@ -972,6 +1146,11 @@ class LoadGenerator:
                     shared_max_concurrency,
                     self.base_seed,
                     stage_barrier,
+                    self.pre_generate,
+                    self._warmup_phase,
+                    self._warmup_barrier,
+                    self._warmup_num_requests,
+                    self._warmup_active_workers,
                 )
             )
             self.workers[-1].start()

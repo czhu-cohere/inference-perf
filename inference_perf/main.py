@@ -156,6 +156,11 @@ def main_cli() -> None:
                 stage.rate = stage.num_requests
         # Set to 0 to show that worker_max_concurrency was not relevant in concurrent load type
         config.load.worker_max_concurrency = 0
+        # Pre-generate request payloads before the timed stage by default for concurrent load,
+        # so heavy tokenization stays off the dispatch critical path and requests launch as a
+        # clean concurrent wave. Users can opt out by setting load.pre_generate: false.
+        if config.load.pre_generate is None:
+            config.load.pre_generate = True
     # Note: StandardLoadStage validation is automatically handled by Pydantic
 
     # Define Circuit Breakers

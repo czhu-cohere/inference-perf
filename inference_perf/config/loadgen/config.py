@@ -188,6 +188,18 @@ class LoadConfig(StrictBaseModel):
         default_factory=lambda: int(time.time() * 1000),
         description="Base random seed for load generation. Defaults to the current time.",
     )
+    pre_generate: Optional[bool] = Field(
+        default=None,
+        description=(
+            "Materialize (generate + tokenize) every request's payload before the timed dispatch "
+            "stage begins, instead of lazily at dispatch time inside the worker. This keeps expensive "
+            "tokenizer work (e.g. long random prompts) off the dispatch critical path so requests reach "
+            "the configured concurrency immediately at stage start. Generation is parallelized across the "
+            "worker pool during a warmup phase and preserves per-worker RNG determinism. "
+            "Only applies to worker-backed runs (num_workers > 0) with lazy-loading data generators. "
+            "Defaults to True for the 'concurrent' load type and False otherwise."
+        ),
+    )
 
     @model_validator(mode="after")
     def validate_load_config(self) -> "LoadConfig":

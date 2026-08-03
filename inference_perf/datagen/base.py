@@ -15,7 +15,7 @@ from inference_perf.apis import InferenceAPIData, LazyLoadInferenceAPIData
 from inference_perf.utils.custom_tokenizer import CustomTokenizer
 from inference_perf.config import APIConfig, APIType, DataConfig, Distribution, SharedPrefix, TraceConfig
 from abc import ABC, abstractmethod
-from typing import Generator, Optional, List, Dict, Any
+from typing import Generator, Iterable, Optional, List, Dict, Any
 
 
 class BaseGenerator(ABC):
@@ -243,6 +243,12 @@ class LazyLoadDataMixin(ABC):
     or unpickleable, or need to be initialized in the worker process.
     """
 
+    # Per-instance cache of pre-generated payloads keyed by data_index. Populated by
+    # pregenerate() during the pre-dispatch warmup phase and consumed by get_request()
+    # during dispatch so no tokenization happens on the critical path. Defaults to None
+    # (lazy behavior) until pregenerate() is called.
+    _pregen_cache: Optional[Dict[int, InferenceAPIData]] = None
+
     @abstractmethod
     def load_lazy_data(self, data: LazyLoadInferenceAPIData) -> InferenceAPIData:
         """Load the actual data for a lazy placeholder.
@@ -257,13 +263,45 @@ class LazyLoadDataMixin(ABC):
         """
         raise NotImplementedError
 
+    def pregenerate(self, data_indices: Iterable[int]) -> None:
+        """Eagerly materialize payloads for the given data indices into an in-instance cache.
+
+        Called during the pre-dispatch warmup phase (typically from a worker process for the
+        subset of ``data_index`` values that worker will handle). Indices are generated in
+        ascending order so the underlying RNG advances identically to the lazy dispatch path,
+        preserving byte-identical prompt content for a given seed.
+
+        Args:
+            data_indices: The ``data_index`` values this generator should pre-materialize.
+        """
+        cache: Dict[int, InferenceAPIData] = {}
+        for data_index in sorted(data_indices):
+            cache[data_index] = self.load_lazy_data(LazyLoadInferenceAPIData(data_index=data_index))
+        self._pregen_cache = cache
+
+    def take_pregenerated(self, data_index: int) -> Optional[InferenceAPIData]:
+        """Pop and return the pre-generated payload for ``data_index``, or None on a miss.
+
+        Popping frees the cached payload as soon as it is dispatched, bounding peak memory to
+        the not-yet-dispatched remainder of the warmed batch.
+        """
+        if self._pregen_cache is None:
+            return None
+        return self._pregen_cache.pop(data_index, None)
+
+    def clear_pregenerated(self) -> None:
+        """Drop any remaining pre-generated payloads (e.g. between stages)."""
+        self._pregen_cache = None
+
     @staticmethod
     def get_request(data_generator: BaseGenerator, data: InferenceAPIData) -> InferenceAPIData:
         """Static utility method to handle lazy loading.
 
         Usage: LazyLoadDataMixin.get_request(datagen, data)
 
-        Checks if datagen supports lazy loading and materializes data if needed.
+        Checks if datagen supports lazy loading and materializes data if needed. When the
+        generator has a pre-generated payload for this data_index (populated by pregenerate()),
+        the cached payload is returned and no tokenization occurs on the dispatch path.
         Works with both DataGenerator and SessionGenerator.
 
         Args:
@@ -275,7 +313,9 @@ class LazyLoadDataMixin(ABC):
         """
         if isinstance(data, LazyLoadInferenceAPIData):
             if isinstance(data_generator, LazyLoadDataMixin):
-                result = data_generator.load_lazy_data(data)
+                result = data_generator.take_pregenerated(data.data_index)
+                if result is None:
+                    result = data_generator.load_lazy_data(data)
                 # Propagate session_id from the lazy wrapper to the materialized object
                 if data.session_id is not None and hasattr(result, "session_id"):
                     result.session_id = data.session_id
