@@ -459,6 +459,25 @@ class LoadGenerator:
             return str(np.random.choice(self.lora_adapters, p=self.lora_weights))
         return None
 
+    def _pregeneration_channel_count(self) -> int:
+        """Number of per-worker queue channels needed for the pre-generation routing.
+
+        Requests are routed round-robin over the first ``active_workers`` workers, where
+        ``active_workers = min(num_workers, concurrency_level)`` for concurrent stages (and
+        ``num_workers`` otherwise). Workers beyond that are always assigned 0 concurrency and
+        never pull, so we only need one channel per potentially-active worker. This avoids
+        allocating one queue per CPU (and its semaphores) on many-core nodes running a low
+        concurrency level, which needlessly pressures ``/dev/shm``.
+        """
+        if self.load_type == LoadType.CONCURRENT:
+            max_concurrency = max(
+                (stage.concurrency_level for stage in self.stages if isinstance(stage, ConcurrentLoadStage)),
+                default=self.num_workers,
+            )
+            return max(1, min(self.num_workers, max_concurrency))
+        # Non-concurrent pre-generation (opt-in) uses every worker.
+        return self.num_workers
+
     async def _run_pregeneration(self, num_requests: int, active_workers: int) -> None:
         """Drive the worker-pool warmup: workers materialize all payloads before dispatch.
 
@@ -1100,9 +1119,18 @@ class LoadGenerator:
 
     async def mp_run(self, client: ModelServerClient) -> None:
         # Pre-generation and preferred-worker routing both require per-worker channels so a
-        # request lands on the worker that materialized (or otherwise owns) it.
-        use_per_worker_channels = self.datagen.is_preferred_worker_requested() or self.pre_generate
-        request_queue: RequestQueue[RequestQueueData] = RequestQueue(self.num_workers if use_per_worker_channels else 1)
+        # request lands on the worker that materialized (or otherwise owns) it. Preferred-worker
+        # routing can target any worker id, so it needs a channel per worker; pre-generation
+        # only routes to workers that can be active, so it needs fewer channels (bounded by the
+        # max concurrency level). Each channel is a JoinableQueue backed by several semaphores,
+        # so keeping this minimal limits /dev/shm pressure on many-core nodes.
+        if self.datagen.is_preferred_worker_requested():
+            num_channels = self.num_workers
+        elif self.pre_generate:
+            num_channels = self._pregeneration_channel_count()
+        else:
+            num_channels = 1
+        request_queue: RequestQueue[RequestQueueData] = RequestQueue(num_channels)
         finished_requests_counter: "Synchronized[int]" = mp.Value("i", 0)
         active_requests_counter: "Synchronized[int]" = mp.Value("i", 0)
         request_phase: SyncEvent = mp.Event()

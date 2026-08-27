@@ -164,6 +164,19 @@ class TestPreGenerateConcurrent(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(prompts), num_requests)
         self.assertEqual(len(set(prompts)), num_requests)
 
+    async def test_pre_generate_correct_with_many_idle_workers(self) -> None:
+        """Low concurrency on many workers: only min(workers, concurrency) channels are
+        allocated, and the many idle workers must not break routing or correctness.
+
+        Guards the /dev/shm-pressure fix (fewer queues) alongside routing correctness.
+        """
+        num_requests = 6
+        prompts = await _run_and_collect_prompts(
+            num_requests=num_requests, concurrency_level=2, num_workers=6, pre_generate=True
+        )
+        self.assertEqual(len(prompts), num_requests)
+        self.assertEqual(len(set(prompts)), num_requests)
+
 
 class TestPreGenerateResolution(unittest.TestCase):
     def _make_gen(self, load_type: LoadType, pre_generate: Any) -> LoadGenerator:
@@ -195,6 +208,37 @@ class TestPreGenerateResolution(unittest.TestCase):
 
     def test_explicit_opt_out_for_concurrent(self) -> None:
         self.assertFalse(self._make_gen(LoadType.CONCURRENT, False).pre_generate)
+
+
+class TestPreGenerationChannelCount(unittest.TestCase):
+    """The number of per-worker queue channels must be bounded by the concurrency level so
+    low-concurrency runs on many-core nodes don't allocate one queue (and its semaphores) per
+    CPU (regression guard for /dev/shm exhaustion)."""
+
+    def _make_gen(self, num_workers: int, concurrency_levels: List[int]) -> LoadGenerator:
+        api_config = APIConfig(type=APIType.Completion, streaming=False)
+        data_config = DataConfig(
+            type=DataGenType.Random,
+            input_distribution=Distribution(min=10, max=10, mean=10.0, std_dev=0.0, total_count=64),
+            output_distribution=Distribution(min=5, max=5, mean=5.0, std_dev=0.0, total_count=64),
+        )
+        datagen = RandomDataGenerator(api_config, data_config, _DummyCustomTokenizer(), seed=1)
+        stages = [ConcurrentLoadStage(num_requests=8, concurrency_level=c) for c in concurrency_levels]
+        cfg = LoadConfig(type=LoadType.CONCURRENT, num_workers=num_workers, stages=stages)
+        with patch("inference_perf.loadgen.load_generator.get_circuit_breaker"):
+            return LoadGenerator(datagen, cfg)
+
+    def test_channels_capped_by_concurrency(self) -> None:
+        gen = self._make_gen(num_workers=64, concurrency_levels=[4])
+        self.assertEqual(gen._pregeneration_channel_count(), 4)
+
+    def test_channels_capped_by_workers(self) -> None:
+        gen = self._make_gen(num_workers=2, concurrency_levels=[8])
+        self.assertEqual(gen._pregeneration_channel_count(), 2)
+
+    def test_channels_use_max_concurrency_across_stages(self) -> None:
+        gen = self._make_gen(num_workers=64, concurrency_levels=[4, 16, 8])
+        self.assertEqual(gen._pregeneration_channel_count(), 16)
 
 
 if __name__ == "__main__":
