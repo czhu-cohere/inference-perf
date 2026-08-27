@@ -64,6 +64,7 @@ async def test_completion_api_data() -> None:
         "prompt": "Hello, world!",
         "max_tokens": 100,
         "ignore_eos": False,
+        "skip_special_tokens": False,
         "stream": True,
         "stream_options": {"include_usage": True},
     }
@@ -81,6 +82,7 @@ async def test_completion_api_data_add_special_tokens() -> None:
     default_data = CompletionAPIData(prompt="plain")
     default_body = await default_data.to_request_body("test-model", 100, False, False)
     assert "add_special_tokens" not in default_body
+    assert default_body["skip_special_tokens"] is False
 
 
 @pytest.mark.asyncio

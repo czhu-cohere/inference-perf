@@ -266,6 +266,7 @@ class BackendClientSuite:
             "prompt": COMPLETION_PROMPT,
             "max_tokens": 30,
             "ignore_eos": True,
+            "skip_special_tokens": False,
             "stream": True,
             "stream_options": {"include_usage": True},
         }
