@@ -23,7 +23,7 @@ from typing import List, Optional, Tuple
 from unittest.mock import AsyncMock, MagicMock
 
 from inference_perf.apis.user_session import LocalUserSession, UserSessionCompletionAPIData
-from inference_perf.apis import InferenceAPIData
+from inference_perf.apis import InferenceAPIData, LazyLoadInferenceAPIData
 from inference_perf.client.modelserver.base import ModelServerClient
 from inference_perf.client.modelserver.metrics import BaseMetrics
 from inference_perf.config import (
@@ -55,15 +55,20 @@ def _mock_tokenizer() -> MagicMock:
     return tok
 
 
-def _make_datagen(num_groups: int = 1, num_prompts_per_group: int = 1) -> SharedPrefixDataGenerator:
-    api_config = APIConfig(type=APIType.Completion)
+def _make_datagen(
+    num_groups: int = 1,
+    num_prompts_per_group: int = 1,
+    return_token_ids: bool = False,
+    system_prompt_len: int = 5,
+) -> SharedPrefixDataGenerator:
+    api_config = APIConfig(type=APIType.Completion, return_token_ids=return_token_ids)
     data_config = DataConfig(
         type=DataGenType.SharedPrefix,
         shared_prefix=SharedPrefix(
             num_groups=num_groups,
             num_prompts_per_group=num_prompts_per_group,
             enable_multi_turn_chat=True,
-            system_prompt_len=5,
+            system_prompt_len=system_prompt_len,
             question_len=5,
             output_len=5,
             seed=42,
@@ -179,6 +184,37 @@ class TestLocalUserSessionLifecycle:
         tokenizer.get_tokenizer().encode.assert_called_once_with(" second", add_special_tokens=False)
         assert second_payload["prompt"] == [10, 11, 20, 21, 30, 31]
         session.update_context(session.context)
+
+    @pytest.mark.asyncio
+    async def test_shared_prefix_raw_token_session_retains_tokenizer(self) -> None:
+        datagen = _make_datagen(return_token_ids=True, system_prompt_len=0)
+        assert datagen.tokenizer is not None
+        datagen.tokenizer.get_tokenizer().encode.return_value = [30, 31]
+        config = APIConfig(type=APIType.Completion, return_token_ids=True)
+
+        first_turn = datagen.load_lazy_data(LazyLoadInferenceAPIData(data_index=0))
+        assert isinstance(first_turn, UserSessionCompletionAPIData)
+        await first_turn.to_request_body("model", 2, False, False)
+
+        response = MagicMock()
+        response.json = AsyncMock(
+            return_value={
+                "choices": [
+                    {
+                        "text": "decoded output",
+                        "prompt_token_ids": [10, 11],
+                        "token_ids": [20, 21],
+                    }
+                ]
+            }
+        )
+        await first_turn.process_response(response, config, datagen.tokenizer)
+
+        second_turn = datagen.load_lazy_data(LazyLoadInferenceAPIData(data_index=1))
+        assert isinstance(second_turn, UserSessionCompletionAPIData)
+        second_payload = await second_turn.to_request_body("model", 2, False, False)
+
+        assert second_payload["prompt"] == [10, 11, 20, 21, 30, 31]
 
     def test_context_does_not_leak_across_stage_boundary(self) -> None:
         """
