@@ -95,6 +95,43 @@ def test_summarize_requests_with_chunks() -> None:
     assert ttft_summary["mean"] == pytest.approx(1.0)
 
 
+def test_summarize_requests_prefers_returned_token_ids() -> None:
+    from unittest.mock import Mock
+
+    mock_tokenizer = Mock()
+    mock_tokenizer.count_tokens.return_value = 99
+    info = InferenceInfo(
+        request_metrics=RequestMetrics(text=Text(input_tokens=4)),
+        response_metrics=StreamedResponseMetrics(
+            output_tokens=3,
+            response_chunks=[
+                '{"choices": [{"text": "first", "token_ids": [10, 11]}]}',
+                '{"choices": [{"text": "second", "token_ids": [12]}]}',
+            ],
+            chunk_times=[1.0, 2.0],
+            server_usage={"completion_tokens": 3},
+        ),
+    )
+    metric = RequestLifecycleMetric(
+        scheduled_time=0.0,
+        start_time=0.0,
+        end_time=3.0,
+        request_data="test_request",
+        info=info,
+        error=None,
+    )
+
+    result = summarize_requests([metric], [50], tokenizer=mock_tokenizer)
+
+    assert isinstance(metric.info.response_metrics, StreamedResponseMetrics)
+    assert metric.info.response_metrics.output_tokens == 3
+    assert metric.info.response_metrics.output_token_times == [1.0, 1.0, 2.0]
+    assert result.successes["output_len"]["mean"] == 3
+    assert result.successes["throughput"]["output_tokens_per_sec"] == 1
+    assert result.successes["token_count_mismatches"] == 0
+    mock_tokenizer.count_tokens.assert_not_called()
+
+
 def test_summarize_requests_multiple_tokens_same_timestamp() -> None:
     from unittest.mock import Mock
 

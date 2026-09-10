@@ -13,6 +13,8 @@
 # limitations under the License.
 """Validity rules for ``inference_perf.config.apis``."""
 
+import pytest
+
 from inference_perf.config import APIConfig, APIType, ResponseFormat, ResponseFormatType
 
 
@@ -20,7 +22,14 @@ def test_api_config_defaults() -> None:
     cfg = APIConfig()
     assert cfg.type == APIType.Completion
     assert cfg.streaming is False
+    assert cfg.return_token_ids is False
     assert cfg.response_format is None
+
+
+def test_return_token_ids_is_completion_only() -> None:
+    assert APIConfig(type=APIType.Completion, return_token_ids=True).return_token_ids is True
+    with pytest.raises(ValueError, match="only supported for the completions endpoint"):
+        APIConfig(type=APIType.Chat, return_token_ids=True)
 
 
 def test_response_format_json_schema_is_default() -> None:

@@ -19,7 +19,7 @@ from aiohttp import ClientResponse
 
 from inference_perf.apis import ChatCompletionAPIData, ChatMessage, UnaryResponseMetrics
 from inference_perf.apis.completion import CompletionAPIData
-from inference_perf.config import APIType
+from inference_perf.config import APIConfig, APIType
 
 
 def _make_tokenizer() -> MagicMock:
@@ -68,6 +68,38 @@ async def test_completion_api_data() -> None:
         "stream": True,
         "stream_options": {"include_usage": True},
     }
+
+
+@pytest.mark.asyncio
+async def test_streaming_completion_uses_returned_token_ids() -> None:
+    data = CompletionAPIData(prompt="Hello")
+    response = cast(
+        ClientResponse,
+        _FakeStreamingResponse(
+            [
+                (
+                    b'data: {"choices":[{"text":"A","prompt_token_ids":[10,11],"token_ids":[20]}]}\n\n'
+                    b'data: {"choices":[{"text":"B","token_ids":[21]}]}\n\n'
+                    b"data: [DONE]\n\n"
+                )
+            ]
+        ),
+    )
+    tokenizer = MagicMock()
+    tokenizer.count_tokens.return_value = 999
+
+    info = await data.process_response(
+        response,
+        APIConfig(type=APIType.Completion, streaming=True, return_token_ids=True),
+        tokenizer,
+    )
+
+    assert data.prompt_token_ids == [10, 11]
+    assert data.model_response_token_ids == [20, 21]
+    assert data.model_response == "AB"
+    assert info.request_metrics.text.input_tokens == 2
+    assert info.response_metrics is not None
+    assert info.response_metrics.output_tokens == 2
 
 
 @pytest.mark.asyncio

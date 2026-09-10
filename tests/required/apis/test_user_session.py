@@ -20,7 +20,7 @@ import pytest
 from collections import defaultdict
 from queue import Empty
 from typing import List, Optional, Tuple
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 from inference_perf.apis.user_session import LocalUserSession, UserSessionCompletionAPIData
 from inference_perf.apis import InferenceAPIData
@@ -135,6 +135,50 @@ class TestLocalUserSessionLifecycle:
         assert new_s1.context == ""
         assert new_s1._current_round == 0
         assert new_s2.context == ""
+
+    @pytest.mark.asyncio
+    async def test_multi_turn_reuses_server_token_ids_without_retokenizing_output(self) -> None:
+        tokenizer = MagicMock()
+        tokenizer.get_tokenizer().encode.return_value = [30, 31]
+        session = LocalUserSession("raw_tokens", context="system", tokenizer=tokenizer)
+        LocalUserSession._instances[session.user_session_id] = session
+        config = APIConfig(type=APIType.Completion, return_token_ids=True)
+
+        first_turn = UserSessionCompletionAPIData(
+            prompt="first",
+            max_tokens=2,
+            user_session_id=session.user_session_id,
+            target_round=0,
+        )
+        first_payload = await first_turn.to_request_body("model", 2, False, False)
+        assert first_payload["prompt"] == "system first"
+
+        response = MagicMock()
+        response.json = AsyncMock(
+            return_value={
+                "choices": [
+                    {
+                        "text": "decoded output",
+                        "prompt_token_ids": [10, 11],
+                        "token_ids": [20, 21],
+                    }
+                ]
+            }
+        )
+        await first_turn.process_response(response, config, tokenizer)
+        assert session.context == [10, 11, 20, 21]
+
+        second_turn = UserSessionCompletionAPIData(
+            prompt="second",
+            max_tokens=2,
+            user_session_id=session.user_session_id,
+            target_round=1,
+        )
+        second_payload = await second_turn.to_request_body("model", 2, False, False)
+
+        tokenizer.get_tokenizer().encode.assert_called_once_with(" second", add_special_tokens=False)
+        assert second_payload["prompt"] == [10, 11, 20, 21, 30, 31]
+        session.update_context(session.context)
 
     def test_context_does_not_leak_across_stage_boundary(self) -> None:
         """

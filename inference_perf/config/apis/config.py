@@ -15,7 +15,7 @@ from enum import Enum
 from typing import Any, Optional
 
 from inference_perf.config.common import StrictBaseModel
-from pydantic import Field
+from pydantic import Field, model_validator
 
 
 class APIType(Enum):
@@ -64,6 +64,10 @@ class APIConfig(StrictBaseModel):
     streaming: bool = Field(
         default=False, description="Stream responses instead of waiting for the full response. Enables TTFT and TPOT metrics."
     )
+    return_token_ids: bool = Field(
+        default=False,
+        description="Request prompt and generated token IDs from the completions endpoint.",
+    )
     headers: Optional[dict[str, str]] = Field(default=None, description="Additional HTTP headers to send with every request.")
     slo_unit: Optional[str] = Field(
         default=None, description="Time unit for SLO header values: 's', 'ms' or 'us'. Defaults to 'ms'."
@@ -90,3 +94,9 @@ class APIConfig(StrictBaseModel):
         default=None,
         description="Response header carrying a server-assigned session token, replayed as a request header on later requests of the same session to keep router session affinity.",
     )
+
+    @model_validator(mode="after")
+    def validate_return_token_ids(self) -> "APIConfig":
+        if self.return_token_ids and self.type != APIType.Completion:
+            raise ValueError("api.return_token_ids is only supported for the completions endpoint")
+        return self

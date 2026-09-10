@@ -277,6 +277,7 @@ class SharedPrefixDataGenerator(DataGenerator, LazyLoadDataMixin):
                         LocalUserSession(
                             user_session_id=f"user_session_{self.num_prompts_per_group * group_id + prompt_id}",
                             context=shared_prefix_text,
+                            tokenizer=self.tokenizer,
                         )
                     )
 

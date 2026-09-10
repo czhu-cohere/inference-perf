@@ -102,7 +102,7 @@ class _ConversationReplayAPIData(UserSessionCompletionAPIData):
             await asyncio.sleep(self.tool_call_latency_sec)
 
         # Release the session lock by updating context (allows next turn).
-        self.user_session.update_context(self.prompt + " " + self.model_response)
+        self.user_session.update_context(self.get_updated_context(config))
         return inference_info
 
     async def process_failure(

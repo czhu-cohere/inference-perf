@@ -35,11 +35,72 @@ import asyncio
 import json
 import time
 import logging
+import re
 import requests
 import ssl
 
 
 logger = logging.getLogger(__name__)
+
+
+def _remove_prompt_token_ids(value: Any) -> bool:
+    """Remove echoed prompt token IDs while preserving generated token IDs."""
+    removed = False
+    if isinstance(value, dict):
+        if "prompt_token_ids" in value:
+            del value["prompt_token_ids"]
+            removed = True
+        for child in value.values():
+            removed = _remove_prompt_token_ids(child) or removed
+    elif isinstance(value, list):
+        for child in value:
+            removed = _remove_prompt_token_ids(child) or removed
+    return removed
+
+
+def _strip_prompt_token_ids(response_content: str) -> str:
+    """Strip prompt_token_ids from JSON or SSE response content."""
+
+    def strip_json(payload: str) -> str:
+        try:
+            parsed = json.loads(payload)
+        except json.JSONDecodeError:
+            return payload
+        if not _remove_prompt_token_ids(parsed):
+            return payload
+        return json.dumps(parsed, separators=(",", ":"))
+
+    stripped_json = strip_json(response_content)
+    if stripped_json != response_content:
+        return stripped_json
+
+    sanitized_lines = []
+    for line in response_content.splitlines(keepends=True):
+        if line.endswith("\r\n"):
+            body, line_ending = line[:-2], "\r\n"
+        elif line.endswith("\n"):
+            body, line_ending = line[:-1], "\n"
+        else:
+            body, line_ending = line, ""
+
+        match = re.match(r"^([ \t]*data:[ \t]*)(.*)$", body)
+        if match:
+            body = match.group(1) + strip_json(match.group(2))
+        sanitized_lines.append(body + line_ending)
+
+    return "".join(sanitized_lines)
+
+
+def _strip_tokenized_prompt(request_data: str) -> str:
+    """Remove a pre-tokenized prompt from the copy saved in per-request metrics."""
+    try:
+        payload = json.loads(request_data)
+    except json.JSONDecodeError:
+        return request_data
+    if not isinstance(payload, dict) or not isinstance(payload.get("prompt"), list):
+        return request_data
+    del payload["prompt"]
+    return json.dumps(payload, separators=(",", ":"))
 
 
 class OpenAIMetrics(BaseMetrics):
@@ -275,7 +336,7 @@ class openAIModelServerClientSession(ModelServerClientSession):
                     # Record tool definitions so they appear in Jaeger alongside the request.
                     if hasattr(data, "tool_definitions") and data.tool_definitions:
                         otel_response_info["tool_definitions"] = json.dumps(data.tool_definitions)
-                elif hasattr(data, "prompt"):
+                elif hasattr(data, "prompt") and isinstance(data.prompt, str):
                     # Text completion - store as prompt string (gen_ai.prompt)
                     otel_response_info["input_prompt"] = data.prompt
 
@@ -371,6 +432,8 @@ class openAIModelServerClientSession(ModelServerClientSession):
         # Add response_format for structured output if configured.
         if self.client.api_config.type != APIType.AnthropicMessages and self.client.api_config.response_format:
             payload["response_format"] = self.client.api_config.response_format.to_api_format()
+        if self.client.api_config.type == APIType.Completion and self.client.api_config.return_token_ids:
+            payload["return_token_ids"] = True
 
         headers = {"Content-Type": "application/json"}
 
@@ -562,10 +625,20 @@ class openAIModelServerClientSession(ModelServerClientSession):
         if data.labels:
             info.labels = data.labels
 
+        if self.client.api_config.type == APIType.Completion and self.client.api_config.return_token_ids:
+            saved_request_data = _strip_tokenized_prompt(request_data)
+            response_content = _strip_prompt_token_ids(response_content)
+            if isinstance(info.response_metrics, StreamedResponseMetrics):
+                info.response_metrics.response_chunks = [
+                    _strip_prompt_token_ids(chunk) for chunk in info.response_metrics.response_chunks
+                ]
+        else:
+            saved_request_data = request_data
+
         metric = RequestLifecycleMetric(
             stage_id=stage_id,
             session_id=data.session_id if isinstance(data.session_id, str) else None,
-            request_data=request_data,
+            request_data=saved_request_data,
             response_data=response_content,
             info=info,
             error=error,

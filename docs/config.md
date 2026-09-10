@@ -30,6 +30,7 @@ Controls the API interaction behavior. If SLO headers are present, each request 
 api:
   type: completion             # API type (completion|chat|anthropic_messages)
   streaming: true             # Enable streaming for TTFT, ITL, and TPOT metrics
+  return_token_ids: false      # Return generated token IDs for completions; omit prompt token IDs from per-request reports
   headers:                     # Optional custom HTTP headers
     x-inference-model: llama
     x-routing-strategy: round-robin
@@ -39,6 +40,15 @@ api:
   slo_tpot_header: "x-slo-tpot-ms"        # Optional header name for TPOT SLO Header, default is x-slo-tpot-ms
   slo_ttft_header: "x-slo-ttft-ms"        # Optional header name for TTFT SLO Header, default is x-slo-ttft-ms
 ```  
+
+For vLLM completion workloads, `return_token_ids: true` carries each multi-turn
+session forward as token IDs. After the first turn, the next prompt is built
+from vLLM's returned `prompt_token_ids`, the generated `token_ids`, and the
+locally tokenized next-turn text. This avoids decoding and re-tokenizing prior
+model output. Tokenized prompts and echoed `prompt_token_ids` are omitted from
+per-request reports, while generated `token_ids` are retained. Returned token
+IDs are also the source of truth for prompt/output lengths and all derived
+lifecycle, throughput, goodput, and session metrics.
 
 ### Data Generation
 

@@ -13,7 +13,7 @@
 # limitations under the License.
 import logging
 import asyncio
-from typing import Optional
+from typing import List, Optional, Union
 from pydantic import ConfigDict, Field
 
 from aiohttp import ClientResponse
@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 class LocalUserSession:
     user_session_id: str
-    context: str
+    context: Union[str, List[int]]
     system_prompt: str
     max_model_len: Optional[int]
     history: list[str]
@@ -37,7 +37,7 @@ class LocalUserSession:
     def __init__(
         self,
         user_session_id: str,
-        context: str = "",
+        context: Union[str, List[int]] = "",
         system_prompt: str = "",
         tokenizer: Optional[CustomTokenizer] = None,
         max_model_len: Optional[int] = None,
@@ -68,7 +68,7 @@ class LocalUserSession:
         if self._waiting_rounds is None:
             self._waiting_rounds = asyncio.Queue()
 
-    async def get_context(self, round: int) -> str:
+    async def get_context(self, round: int) -> Union[str, List[int]]:
         self._ensure_initialized()
         assert self._waiting_rounds is not None
         assert self._in_flight is not None
@@ -81,8 +81,10 @@ class LocalUserSession:
         self._current_round += 1
         return self.context
 
-    def update_context(self, response: str) -> None:
-        if self.system_prompt and self.tokenizer and self.max_model_len:
+    def update_context(self, response: Union[str, List[int]]) -> None:
+        if isinstance(response, list):
+            self.context = response
+        elif self.system_prompt and self.tokenizer and self.max_model_len:
             history_context = " ".join(self.history) if self.history else ""
             base_len = len(self.system_prompt)
             if history_context:
@@ -143,13 +145,37 @@ class UserSessionCompletionAPIData(CompletionAPIData):
     ) -> RequestBody:
         self._session_context = await self.user_session.get_context(self.target_round)
 
-        if self.user_session.tokenizer and self.user_session.max_model_len:
+        if isinstance(self._session_context, list):
+            if self.user_session.tokenizer is None:
+                raise ValueError("Tokenizer is required to extend a tokenized multi-turn prompt")
+            if isinstance(self.prompt, list):
+                current_prompt_token_ids = self.prompt
+            else:
+                current_prompt_token_ids = list(
+                    self.user_session.tokenizer.get_tokenizer().encode(
+                        " " + self.prompt,
+                        add_special_tokens=False,
+                    )
+                )
+            target_len = (
+                self.user_session.max_model_len - max_tokens - 200 if self.user_session.max_model_len is not None else None
+            )
+            if target_len is not None:
+                current_prompt_token_ids = current_prompt_token_ids[:target_len]
+                available_context = max(0, target_len - len(current_prompt_token_ids))
+                session_context = self._session_context[-available_context:] if available_context else []
+            else:
+                session_context = self._session_context
+            self.prompt = session_context + current_prompt_token_ids
+        elif self.user_session.tokenizer and self.user_session.max_model_len:
             # 200 token buffer to ensure we stay under model's context length regardless of any tokenization variations
             target_len = self.user_session.max_model_len - max_tokens - 200
             hf_tokenizer = self.user_session.tokenizer.get_tokenizer()
 
             system_prompt = self.user_session.system_prompt
             history = list(self.user_session.history)
+            if not isinstance(self.prompt, str):
+                raise ValueError("A tokenized prompt cannot be appended to string session context")
             current_prompt = self.prompt
 
             def get_text(sys: str, hist: list[str], curr: str) -> str:
@@ -207,9 +233,20 @@ class UserSessionCompletionAPIData(CompletionAPIData):
 
             self.prompt = combined_text
         else:
+            if not isinstance(self.prompt, str):
+                raise ValueError("A tokenized prompt cannot be appended to string session context")
             self.prompt = self._session_context + " " + self.prompt
 
         return await super().to_request_body(effective_model_name, max_tokens, ignore_eos, streaming)
+
+    def get_updated_context(self, config: APIConfig) -> Union[str, List[int]]:
+        if config.return_token_ids:
+            if self.prompt_token_ids is None or self.model_response_token_ids is None:
+                raise ValueError("vLLM did not return token IDs for a multi-turn completion")
+            return self.prompt_token_ids + self.model_response_token_ids
+        if not isinstance(self.prompt, str):
+            raise ValueError("Expected string prompt when return_token_ids is disabled")
+        return self.prompt + " " + self.model_response
 
     def update_inference_info(self, inference_info: InferenceInfo) -> None:
         inference_info.extra_info["user_session"] = self.user_session_id
@@ -218,9 +255,9 @@ class UserSessionCompletionAPIData(CompletionAPIData):
     async def process_response(
         self, response: ClientResponse, config: APIConfig, tokenizer: CustomTokenizer, lora_adapter: Optional[str] = None
     ) -> InferenceInfo:
-        inference_info = await super().process_response(response, config, tokenizer)
+        inference_info = await super().process_response(response, config, tokenizer, lora_adapter)
         self.update_inference_info(inference_info)
-        self.user_session.update_context(self.prompt + " " + self.model_response)
+        self.user_session.update_context(self.get_updated_context(config))
         return inference_info
 
     async def process_failure(
