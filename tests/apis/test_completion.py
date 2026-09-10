@@ -26,6 +26,7 @@ async def test_completion_api_data() -> None:
         "prompt": "Hello, world!",
         "max_tokens": 100,
         "ignore_eos": False,
+        "skip_special_tokens": False,
         "stream": True,
         "stream_options": {"include_usage": True},
     }

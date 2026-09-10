@@ -43,6 +43,7 @@ class CompletionAPIData(InferenceAPIData):
             "prompt": self.prompt,
             "max_tokens": self.max_tokens,
             "ignore_eos": ignore_eos,
+            "skip_special_tokens": False,
             "stream": streaming,
             **({"stream_options": {"include_usage": True}} if streaming else {}),
         }
