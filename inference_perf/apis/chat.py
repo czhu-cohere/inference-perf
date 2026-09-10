@@ -37,7 +37,12 @@ class ChatCompletionAPIData(InferenceAPIData):
         return "/v1/chat/completions"
 
     async def to_payload(
-        self, effective_model_name: str, max_tokens: int, ignore_eos: bool, streaming: bool
+        self,
+        effective_model_name: str,
+        max_tokens: int,
+        ignore_eos: bool,
+        streaming: bool,
+        tokenizer: Optional[CustomTokenizer] = None,
     ) -> dict[str, Any]:
         if self.max_tokens == 0:
             self.max_tokens = max_tokens

@@ -62,11 +62,21 @@ class ResponseFormat(BaseModel):
 class APIConfig(BaseModel):
     type: APIType = APIType.Completion
     streaming: bool = False
+    return_token_ids: bool = Field(
+        default=False,
+        description="Request prompt and generated token IDs from the completions endpoint.",
+    )
     headers: Optional[dict[str, str]] = None
     slo_unit: Optional[str] = None
     slo_tpot_header: Optional[str] = None
     slo_ttft_header: Optional[str] = None
     response_format: Optional[ResponseFormat] = None
+
+    @model_validator(mode="after")
+    def validate_return_token_ids(self) -> "APIConfig":
+        if self.return_token_ids and self.type != APIType.Completion:
+            raise ValueError("api.return_token_ids is only supported for the completions endpoint")
+        return self
 
 
 class TraceFormat(Enum):

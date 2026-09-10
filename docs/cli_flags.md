@@ -6,6 +6,7 @@ These command line flags are automatically generated from the internal `Config` 
 | --- | --- | --- |
 | `--api.type` | Enum (completion, chat) | Matches api.type in config |
 | `--api.streaming` | boolean | Matches api.streaming in config |
+| `--api.return_token_ids` | boolean | Request prompt and generated token IDs from the completions endpoint. |
 | `--api.headers` | JSON | Matches api.headers in config |
 | `--api.slo_unit` | str | Matches api.slo_unit in config |
 | `--api.slo_tpot_header` | str | Matches api.slo_tpot_header in config |

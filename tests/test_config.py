@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from inference_perf.config import (
+    APIConfig,
     APIType,
     Config,
     DataGenType,
@@ -151,6 +152,13 @@ def test_response_format_to_api_format() -> None:
     # Test JSON_OBJECT
     fmt2 = ResponseFormat(type=ResponseFormatType.JSON_OBJECT)
     assert fmt2.to_api_format() == {"type": "json_object"}
+
+
+def test_return_token_ids_config_is_completion_only() -> None:
+    assert APIConfig().return_token_ids is False
+    assert APIConfig(type=APIType.Completion, return_token_ids=True).return_token_ids is True
+    with pytest.raises(ValueError, match="only supported for the completions endpoint"):
+        APIConfig(type=APIType.Chat, return_token_ids=True)
 
 
 def test_standard_load_stage_validation() -> None:

@@ -13,7 +13,7 @@
 # limitations under the License.
 import logging
 import asyncio
-from typing import Any, Optional
+from typing import Any, List, Optional, Union
 from pydantic import ConfigDict, Field
 
 from aiohttp import ClientResponse
@@ -26,11 +26,11 @@ logger = logging.getLogger(__name__)
 
 class LocalUserSession:
     user_session_id: str
-    context: str
+    context: Union[str, List[int]]
 
     _instances: dict[str, "LocalUserSession"] = {}
 
-    def __init__(self, user_session_id: str, context: str = ""):
+    def __init__(self, user_session_id: str, context: Union[str, List[int]] = ""):
         self.user_session_id = user_session_id
         self.context = context if context else ""
         self._current_round = 0
@@ -53,7 +53,7 @@ class LocalUserSession:
         if self._waiting_rounds is None:
             self._waiting_rounds = asyncio.Queue()
 
-    async def get_context(self, round: int) -> str:
+    async def get_context(self, round: int) -> Union[str, List[int]]:
         self._ensure_initialized()
         assert self._waiting_rounds is not None
         assert self._in_flight is not None
@@ -67,7 +67,7 @@ class LocalUserSession:
         self._current_round += 1
         return self.context
 
-    def update_context(self, response: str) -> None:
+    def update_context(self, response: Union[str, List[int]]) -> None:
         self.context = response
 
         self._ensure_initialized()
@@ -96,15 +96,40 @@ class UserSessionCompletionAPIData(CompletionAPIData):
         return LocalUserSession.get_instance(self.user_session_id)
 
     async def to_payload(
-        self, effective_model_name: str, max_tokens: int, ignore_eos: bool, streaming: bool
+        self,
+        effective_model_name: str,
+        max_tokens: int,
+        ignore_eos: bool,
+        streaming: bool,
+        tokenizer: Optional[CustomTokenizer] = None,
     ) -> dict[str, Any]:
         self._session_context = await self.user_session.get_context(self.target_round)
-        # TODO: Currently, only prompt style (concat messages) support. Adding support for messages style payload.
-        self.prompt = self._session_context + " " + self.prompt
+        if isinstance(self._session_context, list):
+            if tokenizer is None:
+                raise ValueError("Tokenizer is required to extend a tokenized multi-turn prompt")
+            if isinstance(self.prompt, list):
+                current_prompt_token_ids = self.prompt
+            else:
+                current_prompt_token_ids = list(tokenizer.get_tokenizer().encode(" " + self.prompt, add_special_tokens=False))
+            self.prompt = self._session_context + current_prompt_token_ids
+        else:
+            if not isinstance(self.prompt, str):
+                raise ValueError("A tokenized prompt cannot be appended to string session context")
+            # TODO: Currently, only prompt style (concat messages) support. Adding support for messages style payload.
+            self.prompt = self._session_context + " " + self.prompt
         # TODO: The combined prompt (session context + current prompt) might exceed the model's
         #       maximum sequence length. Implement truncation logic/strategy to prevent
         #       errors/failures from the inference server.
-        return await super().to_payload(effective_model_name, max_tokens, ignore_eos, streaming)
+        return await super().to_payload(effective_model_name, max_tokens, ignore_eos, streaming, tokenizer)
+
+    def get_updated_context(self, config: APIConfig) -> Union[str, List[int]]:
+        if config.return_token_ids:
+            if self.prompt_token_ids is None or self.model_response_token_ids is None:
+                raise ValueError("vLLM did not return token IDs for a multi-turn completion")
+            return self.prompt_token_ids + self.model_response_token_ids
+        if not isinstance(self.prompt, str):
+            raise ValueError("Expected string prompt when return_token_ids is disabled")
+        return self.prompt + " " + self.model_response
 
     def update_inference_info(self, inference_info: InferenceInfo) -> None:
         inference_info.extra_info["user_session"] = self.user_session_id
@@ -113,9 +138,9 @@ class UserSessionCompletionAPIData(CompletionAPIData):
     async def process_response(
         self, response: ClientResponse, config: APIConfig, tokenizer: CustomTokenizer, lora_adapter: Optional[str] = None
     ) -> InferenceInfo:
-        inference_info = await super().process_response(response, config, tokenizer)
+        inference_info = await super().process_response(response, config, tokenizer, lora_adapter)
         self.update_inference_info(inference_info)
-        self.user_session.update_context(self.prompt + " " + self.model_response)
+        self.user_session.update_context(self.get_updated_context(config))
         return inference_info
 
     async def process_failure(

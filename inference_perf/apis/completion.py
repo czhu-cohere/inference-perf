@@ -13,9 +13,11 @@
 # limitations under the License.
 
 
-from typing import Any, Optional
+import json
+from typing import Any, List, Optional, Union
 
 from aiohttp import ClientResponse
+from pydantic import Field
 from inference_perf.apis import InferenceAPIData, InferenceInfo, UnaryInferenceResponseInfo, StreamedInferenceResponseInfo
 from inference_perf.utils.custom_tokenizer import CustomTokenizer
 from inference_perf.config import APIConfig, APIType
@@ -23,9 +25,11 @@ from inference_perf.apis.streaming_parser import parse_sse_stream
 
 
 class CompletionAPIData(InferenceAPIData):
-    prompt: str
+    prompt: Union[str, List[int]]
     max_tokens: int = 0
     model_response: str = ""
+    prompt_token_ids: Optional[List[int]] = Field(default=None, exclude=True)
+    model_response_token_ids: Optional[List[int]] = Field(default=None, exclude=True)
 
     def get_api_type(self) -> APIType:
         return APIType.Completion
@@ -34,7 +38,12 @@ class CompletionAPIData(InferenceAPIData):
         return "/v1/completions"
 
     async def to_payload(
-        self, effective_model_name: str, max_tokens: int, ignore_eos: bool, streaming: bool
+        self,
+        effective_model_name: str,
+        max_tokens: int,
+        ignore_eos: bool,
+        streaming: bool,
+        tokenizer: Optional[CustomTokenizer] = None,
     ) -> dict[str, Any]:
         if self.max_tokens == 0:
             self.max_tokens = max_tokens
@@ -48,6 +57,47 @@ class CompletionAPIData(InferenceAPIData):
             **({"stream_options": {"include_usage": True}} if streaming else {}),
         }
 
+    def _capture_returned_token_ids(self, choice: dict[str, Any], append_output: bool = False) -> None:
+        prompt_token_ids = choice.get("prompt_token_ids")
+        if isinstance(prompt_token_ids, list) and all(isinstance(token_id, int) for token_id in prompt_token_ids):
+            self.prompt_token_ids = prompt_token_ids
+
+        token_ids = choice.get("token_ids")
+        if isinstance(token_ids, list) and all(isinstance(token_id, int) for token_id in token_ids):
+            if append_output and self.model_response_token_ids is not None:
+                self.model_response_token_ids.extend(token_ids)
+            else:
+                self.model_response_token_ids = token_ids
+
+    def _capture_stream_token_ids(self, raw_content: str) -> None:
+        self.prompt_token_ids = None
+        self.model_response_token_ids = None
+        for line in raw_content.splitlines():
+            if not line.startswith("data:"):
+                continue
+            data_str = line.removeprefix("data:").strip()
+            if data_str == "[DONE]":
+                continue
+            try:
+                data = json.loads(data_str)
+            except json.JSONDecodeError:
+                continue
+            choices = data.get("choices", [])
+            if choices and isinstance(choices[0], dict):
+                self._capture_returned_token_ids(choices[0], append_output=True)
+
+    def _count_prompt_tokens(self, tokenizer: CustomTokenizer) -> int:
+        if self.prompt_token_ids is not None:
+            return len(self.prompt_token_ids)
+        if isinstance(self.prompt, list):
+            return len(self.prompt)
+        return tokenizer.count_tokens(self.prompt)
+
+    def _count_output_tokens(self, output_text: str, tokenizer: CustomTokenizer) -> int:
+        if self.model_response_token_ids is not None:
+            return len(self.model_response_token_ids)
+        return tokenizer.count_tokens(output_text)
+
     async def process_response(
         self, response: ClientResponse, config: APIConfig, tokenizer: CustomTokenizer, lora_adapter: Optional[str] = None
     ) -> InferenceInfo:
@@ -57,8 +107,10 @@ class CompletionAPIData(InferenceAPIData):
                 response, extract_content=lambda data: data.get("choices", [{}])[0].get("text")
             )
 
-            prompt_len = tokenizer.count_tokens(self.prompt)
-            output_len = tokenizer.count_tokens(output_text)
+            self._capture_stream_token_ids(raw_content)
+            self.model_response = output_text
+            prompt_len = self._count_prompt_tokens(tokenizer)
+            output_len = self._count_output_tokens(output_text, tokenizer)
             return InferenceInfo(
                 input_tokens=prompt_len,
                 response_info=StreamedInferenceResponseInfo(
@@ -73,12 +125,18 @@ class CompletionAPIData(InferenceAPIData):
             )
         else:
             data = await response.json()
-            prompt_len = tokenizer.count_tokens(self.prompt)
             choices = data.get("choices", [])
             if len(choices) == 0:
+                prompt_len = self._count_prompt_tokens(tokenizer)
                 return InferenceInfo(input_tokens=prompt_len, lora_adapter=lora_adapter)
-            output_text = choices[0].get("text", "")
-            output_len = tokenizer.count_tokens(output_text)
+            choice = choices[0]
+            self.prompt_token_ids = None
+            self.model_response_token_ids = None
+            if isinstance(choice, dict):
+                self._capture_returned_token_ids(choice)
+            output_text = choice.get("text", "")
+            prompt_len = self._count_prompt_tokens(tokenizer)
+            output_len = self._count_output_tokens(output_text, tokenizer)
             self.model_response = output_text
             return InferenceInfo(
                 input_tokens=prompt_len,

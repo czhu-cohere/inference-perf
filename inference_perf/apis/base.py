@@ -91,7 +91,12 @@ class InferenceAPIData(BaseModel):
 
     @abstractmethod
     async def to_payload(
-        self, effective_model_name: str, max_tokens: int, ignore_eos: bool, streaming: bool
+        self,
+        effective_model_name: str,
+        max_tokens: int,
+        ignore_eos: bool,
+        streaming: bool,
+        tokenizer: Optional[CustomTokenizer] = None,
     ) -> dict[str, Any]:
         raise NotImplementedError
 
@@ -133,7 +138,12 @@ class LazyLoadInferenceAPIData(InferenceAPIData):
         raise NotImplementedError("LazyLoadInferenceAPIData doesn't support this operation")
 
     async def to_payload(
-        self, effective_model_name: str, max_tokens: int, ignore_eos: bool, streaming: bool
+        self,
+        effective_model_name: str,
+        max_tokens: int,
+        ignore_eos: bool,
+        streaming: bool,
+        tokenizer: Optional[CustomTokenizer] = None,
     ) -> dict[str, Any]:
         raise NotImplementedError("LazyLoadInferenceAPIData doesn't support this operation")
 

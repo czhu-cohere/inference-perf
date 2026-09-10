@@ -397,11 +397,7 @@ def summarize_requests(
         request_latency_values.append(m.end_time - m.start_time)
 
         # Process raw chunks if present and tokenizer is available
-        if (
-            isinstance(m.info.response_info, StreamedInferenceResponseInfo)
-            and m.info.response_info.response_chunks
-            and tokenizer
-        ):
+        if isinstance(m.info.response_info, StreamedInferenceResponseInfo) and m.info.response_info.response_chunks:
             output_token_times = []
             accumulated_tokens = 0
             parsed_chunks = []
@@ -416,14 +412,22 @@ def summarize_requests(
                     data = json.loads(chunk_str)
                     if choices := data.get("choices"):
                         delta = choices[0]
-                        text = delta.get("text") or delta.get("delta", {}).get("content")
-                        if text:
-                            parsed_chunks.append((text, chunk_time))
+                        text = delta.get("text") or delta.get("delta", {}).get("content") or ""
+                        token_ids = delta.get("token_ids")
+                        if not (isinstance(token_ids, list) and all(isinstance(token_id, int) for token_id in token_ids)):
+                            token_ids = None
+                        if text or token_ids is not None:
+                            parsed_chunks.append((text, token_ids, chunk_time))
                 except json.JSONDecodeError:
                     continue
 
-            for text, chunk_time in parsed_chunks:
-                tokens_in_chunk = tokenizer.count_tokens(text)
+            for text, token_ids, chunk_time in parsed_chunks:
+                if token_ids is not None:
+                    tokens_in_chunk = len(token_ids)
+                elif tokenizer is not None:
+                    tokens_in_chunk = tokenizer.count_tokens(text)
+                else:
+                    continue
                 if tokens_in_chunk > 0:
                     # Assign every token in a chunk the chunk's arrival time to match user-perceived
                     # latency: intra-chunk ITL is 0, inter-chunk ITL absorbs the full gap. TPOT still

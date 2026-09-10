@@ -100,7 +100,7 @@ class _ConversationReplayAPIData(UserSessionCompletionAPIData):
             await asyncio.sleep(self.tool_call_latency_sec)
 
         # Release the session lock by updating context (allows next turn).
-        self.user_session.update_context(self.prompt + " " + self.model_response)
+        self.user_session.update_context(self.get_updated_context(config))
         return inference_info
 
     async def process_failure(
@@ -220,7 +220,9 @@ class ConversationReplayDataGenerator(DataGenerator, LazyLoadDataMixin):
                 context=bp.system_prompt,
             )
             logger.debug("Slot %d starting conversation %d", conv_idx, convo_num)
-        elif len(self.user_sessions[conv_idx].context) > 2_700_000:
+        elif len(self.user_sessions[conv_idx].context) > (
+            225_000 if isinstance(self.user_sessions[conv_idx].context, list) else 2_700_000
+        ):
             # Safety reset: context is approaching max_model_len.
             # Random Qwen3 tokens decode to ~12 chars/token on average, so
             # 225K tokens ≈ 2.7M chars. Reset to fresh context rather than
@@ -230,7 +232,7 @@ class ConversationReplayDataGenerator(DataGenerator, LazyLoadDataMixin):
                 context=bp.system_prompt,
             )
             turn_idx = 0
-            logger.warning("Slot %d: safety context reset (context >2.7M chars)", conv_idx)
+            logger.warning("Slot %d: safety context reset (context exceeded size limit)", conv_idx)
 
         latency = bp.turn_tool_call_latencies[turn_idx] if bp.turn_tool_call_latencies else 0.0
         return _ConversationReplayAPIData(
