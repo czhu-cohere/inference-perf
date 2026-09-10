@@ -174,13 +174,34 @@ class SharedPrefixDataGenerator(DataGenerator, LazyLoadDataMixin):
         if self.enable_multi_turn_chat:
             user_id = data.data_index % len(self.user_sessions)
             round = data.data_index // len(self.user_sessions)
+            user_session = self._get_or_create_user_session(user_id, i)
             return UserSessionCompletionAPIData(
                 prompt=self.prompts[i],
                 max_tokens=output_len,
-                user_session_id=self.user_sessions[user_id].user_session_id,
+                user_session_id=user_session.user_session_id,
                 target_round=round,
             )
         return CompletionAPIData(prompt=self.prompts[i], max_tokens=output_len)
+
+    def _get_or_create_user_session(self, user_id: int, prompt_index: int) -> LocalUserSession:
+        """Return the registered session, re-priming it after stage cleanup."""
+        session_id = self.user_sessions[user_id].user_session_id
+        session = LocalUserSession._instances.get(session_id)
+        if session is None:
+            prefix_text = self.prefix_texts[prompt_index]
+            session = LocalUserSession(
+                user_session_id=session_id,
+                context=prefix_text,
+                system_prompt=prefix_text,
+                tokenizer=self.tokenizer,
+            )
+            LocalUserSession._instances[session_id] = session
+            self.user_sessions[user_id] = session
+        elif session.tokenizer is None:
+            # Repair sessions created through LocalUserSession.get_instance()
+            # by older callers before the datagen had a chance to register one.
+            session.tokenizer = self.tokenizer
+        return session
 
     def get_data(self) -> Generator[InferenceAPIData, None, None]:
         if not self.prompts:
@@ -277,6 +298,7 @@ class SharedPrefixDataGenerator(DataGenerator, LazyLoadDataMixin):
                         LocalUserSession(
                             user_session_id=f"user_session_{self.num_prompts_per_group * group_id + prompt_id}",
                             context=shared_prefix_text,
+                            system_prompt=shared_prefix_text,
                             tokenizer=self.tokenizer,
                         )
                     )
